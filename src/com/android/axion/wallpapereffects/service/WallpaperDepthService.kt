@@ -138,12 +138,15 @@ class WallpaperDepthService : Service() {
         val wm = WallpaperManager.getInstance(this)
         val info = wm.wallpaperInfo
         val isLiveWallpaper = info != null
+        val isEffectsWallpaper = info?.component?.packageName == packageName
+        val hasLockWallpaper = hasLockWallpaper(wm)
         Log.d(TAG, "wallpaperInfo=${info?.component}, isLive=$isLiveWallpaper")
 
         if (
             info != null &&
                 info.component.packageName == packageName &&
-                info.component.className.endsWith("MagicPortraitService")
+                info.component.className.endsWith("MagicPortraitService") &&
+                !hasLockWallpaper
         ) {
             Log.d(TAG, "MagicPortraitService active (manages own depth mask), skipping")
             return
@@ -152,7 +155,7 @@ class WallpaperDepthService : Service() {
         clearMask()
 
         val bitmap =
-            loadWallpaperBitmap(wm, isLiveWallpaper)
+            loadWallpaperBitmap(wm, isLiveWallpaper, isEffectsWallpaper, hasLockWallpaper)
                 ?: run {
                     Log.w(TAG, "Could not load wallpaper bitmap")
                     clearMask()
@@ -198,25 +201,30 @@ class WallpaperDepthService : Service() {
         }
     }
 
-    private fun loadWallpaperBitmap(wm: WallpaperManager, isLiveWallpaper: Boolean): Bitmap? {
-        if (isLiveWallpaper) {
-
-            val deBitmap = loadFromDeStorage()
-            if (deBitmap != null) return deBitmap
+    private fun loadWallpaperBitmap(
+        wm: WallpaperManager,
+        isLiveWallpaper: Boolean,
+        isEffectsWallpaper: Boolean,
+        hasLockWallpaper: Boolean,
+    ): Bitmap? {
+        if (hasLockWallpaper) {
+            try {
+                wm.getWallpaperFile(WallpaperManager.FLAG_LOCK)?.use { lockPfd ->
+                    val bmp = BitmapFactory.decodeFileDescriptor(lockPfd.fileDescriptor)
+                    if (bmp != null) {
+                        Log.d(TAG, "Lock wallpaper: ${bmp.width}x${bmp.height}")
+                        return bmp
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Lock wallpaper load failed", e)
+            }
+            return null
         }
 
-        try {
-            val lockPfd = wm.getWallpaperFile(WallpaperManager.FLAG_LOCK)
-            if (lockPfd != null) {
-                val bmp = BitmapFactory.decodeFileDescriptor(lockPfd.fileDescriptor)
-                lockPfd.close()
-                if (bmp != null) {
-                    Log.d(TAG, "Lock wallpaper: ${bmp.width}x${bmp.height}")
-                    return bmp
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Lock wallpaper load failed", e)
+        if (isLiveWallpaper && isEffectsWallpaper) {
+            val deBitmap = loadFromDeStorage()
+            if (deBitmap != null) return deBitmap
         }
 
         try {
@@ -240,6 +248,14 @@ class WallpaperDepthService : Service() {
         }
 
         return null
+    }
+
+    private fun hasLockWallpaper(wm: WallpaperManager): Boolean {
+        return try {
+            wm.getWallpaperFile(WallpaperManager.FLAG_LOCK)?.use { true } == true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun loadFromDeStorage(): Bitmap? {
