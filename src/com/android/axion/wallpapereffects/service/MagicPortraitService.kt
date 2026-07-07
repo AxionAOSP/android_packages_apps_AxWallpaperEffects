@@ -22,6 +22,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.Configuration
 import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -35,6 +36,7 @@ import android.util.Log
 import android.util.Size
 import android.view.MotionEvent
 import android.view.SurfaceHolder
+import android.view.View
 import com.android.axion.wallpapereffects.generateeffect.bgseparation.TFLiteImageSegmenter
 import com.android.axion.wallpapereffects.service.shape.RotationDirection
 import com.android.axion.wallpapereffects.service.shape.SegmentationModel
@@ -55,12 +57,14 @@ import com.android.axion.wallpapereffects.util.ForegroundPositionerImpl
 import com.android.axion.wallpapereffects.util.RectUtils
 import com.android.axion.wallpapereffects.util.ShapePositionHelper
 import com.google.android.torus.canvas.engine.CanvasWallpaperEngine
+import com.google.android.torus.core.content.ConfigurationChangeListener
 import com.google.android.torus.core.engine.TorusEngine
 import com.google.android.torus.core.engine.listener.TorusTouchListener
 import com.google.android.torus.core.wallpaper.LiveWallpaper
 import com.google.android.torus.core.wallpaper.listener.LiveWallpaperEventListener
 import com.google.android.torus.core.wallpaper.listener.LiveWallpaperKeyguardEventListener
 import java.io.File
+import java.security.MessageDigest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -82,6 +86,11 @@ private const val DEFAULT_LSTAR = 45f
 
 private const val PHOTO_FILE = "wallpaper.jpg"
 private const val FOREGROUND_FILE = "effect_foreground.png"
+private const val FOREGROUND_META_FILE = "effect_foreground_v1.meta"
+private const val LEGACY_FOREGROUND_META_FILE = "effect_foreground.meta"
+private const val FOREGROUND_CACHE_VERSION = "portrait-v1"
+
+private data class PhotoToken(val cacheKey: String, val photoSize: Size, val marker: Any = Any())
 
 class MagicPortraitService : LiveWallpaper() {
 
@@ -99,6 +108,7 @@ class MagicPortraitService : LiveWallpaper() {
         private val wallpaperDescription: WallpaperDescription?,
     ) :
         CanvasWallpaperEngine(surfaceHolder, true),
+        ConfigurationChangeListener,
         LiveWallpaperEventListener,
         LiveWallpaperKeyguardEventListener,
         TorusTouchListener {
@@ -119,7 +129,9 @@ class MagicPortraitService : LiveWallpaper() {
         private var surfaceSize: Size? = null
         private var xOffset: Float = 0f
         private var isOnLockscreen = false
-        private var isPaused = false
+        private var isPaused = true
+        private var isRtl =
+            context.resources.configuration.layoutDirection == View.LAYOUT_DIRECTION_RTL
         private var lockscreenBounds: RectF? = null
 
         private var currentShapeIndex = 0
@@ -130,10 +142,13 @@ class MagicPortraitService : LiveWallpaper() {
         private var vibratorManager: VibratorManager? = null
 
         private var cachedDepthPathData: String? = null
-        private var depthMaskActive: Boolean? = null
+        private var activeDepthPathData: String? = null
+        private var depthMaskActive = false
+        private var ownsDepthState = false
 
-        private var wallpaperJob: Job? = null
+        private var foregroundLoadJob: Job? = null
         private var segmentationJob: Job? = null
+        private var activePhotoToken: PhotoToken? = null
 
         private val handler = Handler(Looper.getMainLooper())
         private val settingsObserver =
@@ -155,11 +170,11 @@ class MagicPortraitService : LiveWallpaper() {
         private val rendererCallback =
             object : ShapeRendererCallback {
                 override fun onRedrawNeeded() {
-                    shapeRenderer.redrawNeeded
                     this@PortraitEngine.requestRender()
                 }
 
                 override fun onAnimationStart() {
+                    if (isPaused) return
                     startUpdateLoop()
                 }
 
@@ -180,7 +195,7 @@ class MagicPortraitService : LiveWallpaper() {
             }
 
         private fun requestRender() {
-
+            if (isPaused) return
             startUpdateLoop()
             handler.postDelayed(
                 { if (!shapeRenderer.isAnyAnimationRunning()) stopUpdateLoop() },
@@ -209,6 +224,8 @@ class MagicPortraitService : LiveWallpaper() {
                     shapeColorController,
                 )
             shapeRenderer.onRedrawNeeded = { requestRender() }
+            shapeRenderer.additionalScale =
+                if (isPreview()) shapePositionHelper.maxWallpaperScale else 1f
 
             val cr = context.contentResolver
             cr.registerContentObserver(
@@ -234,25 +251,21 @@ class MagicPortraitService : LiveWallpaper() {
             )
 
             readSettings()
+            loadForegroundIfNeeded()
         }
 
         override fun onResume() {
             super.onResume()
             Log.d(TAG, "onResume")
             isPaused = false
-            if (photoBitmap == null) {
-                loadPhotoAndSegment()
-            }
+            loadForegroundIfNeeded()
+            updateShapeEffectState()
         }
 
         override fun onPause() {
             super.onPause()
             Log.d(TAG, "onPause")
             isPaused = true
-            wallpaperJob?.cancel()
-            wallpaperJob = null
-            segmentationJob?.cancel()
-            segmentationJob = null
             stopUpdateLoop()
         }
 
@@ -279,6 +292,11 @@ class MagicPortraitService : LiveWallpaper() {
             updateShapeEffectState()
         }
 
+        override fun onConfigurationChanged(newConfig: Configuration) {
+            isRtl = newConfig.layoutDirection == View.LAYOUT_DIRECTION_RTL
+            updateShapeEffectState()
+        }
+
         override fun onUpdate(elapsedMs: Long, deltaMs: Long) {
             super.onUpdate(elapsedMs, deltaMs)
             render { canvas -> shapeRenderer.draw(canvas) }
@@ -297,13 +315,17 @@ class MagicPortraitService : LiveWallpaper() {
 
         override fun onSleep(extras: Bundle) {}
 
-        override fun onWake(extras: Bundle) {}
+        override fun onWake(extras: Bundle) {
+            loadForegroundIfNeeded()
+            updateShapeEffectState()
+        }
 
         override fun onTouchEvent(event: MotionEvent) {}
 
         override fun onKeyguardAppearing() {
             Log.d(TAG, "onKeyguardAppearing")
             isOnLockscreen = true
+            loadForegroundIfNeeded()
             updateShapeEffectState()
         }
 
@@ -335,7 +357,10 @@ class MagicPortraitService : LiveWallpaper() {
 
             shapeRenderer.shapeEffectAnimationControllers.forEach { it.onTap() }
 
-            if (shapePositionController.isTapAnimationRunning) {
+            if (
+                shapePositionController.isTapAnimationRunning ||
+                    bitmapPositionController.isTapAnimationRunning
+            ) {
                 vibratorManager
                     ?.defaultVibrator
                     ?.vibrate(ShapeEffectConstants.SHAPE_TAP_VIBRATION_EFFECT)
@@ -344,10 +369,10 @@ class MagicPortraitService : LiveWallpaper() {
 
         override fun onLockscreenLayoutChanged(extras: Bundle) {
 
-            val left = extras.getFloat("left", -1f)
-            val top = extras.getFloat("top", -1f)
-            val right = extras.getFloat("right", -1f)
-            val bottom = extras.getFloat("bottom", -1f)
+            val left = extras.getFloat("wallpaperFocalAreaLeft", extras.getFloat("left", -1f))
+            val top = extras.getFloat("wallpaperFocalAreaTop", extras.getFloat("top", -1f))
+            val right = extras.getFloat("wallpaperFocalAreaRight", extras.getFloat("right", -1f))
+            val bottom = extras.getFloat("wallpaperFocalAreaBottom", extras.getFloat("bottom", -1f))
             if (left >= 0f && top >= 0f && right > left && bottom > top) {
                 lockscreenBounds = RectF(left, top, right, bottom)
             } else {
@@ -392,31 +417,54 @@ class MagicPortraitService : LiveWallpaper() {
             else RotationDirection.COUNTERCLOCKWISE
         }
 
+        private fun loadForegroundIfNeeded() {
+            if (foregroundLoadJob?.isActive == true || segmentationJob?.isActive == true) return
+            if (photoBitmap == null || foregroundBitmap == null || positionModel == null) {
+                loadPhotoAndSegment()
+            }
+        }
+
         private fun loadPhotoAndSegment() {
-            wallpaperJob?.cancel()
-            wallpaperJob =
+            foregroundLoadJob?.cancel()
+            segmentationJob?.cancel()
+            segmentationJob = null
+            foregroundLoadJob =
                 scope.launch {
                     try {
-                        val bitmap =
+                        val photo =
                             loadPhotoFromStorage()
                                 ?: run {
                                     Log.w(TAG, "No photo found in DE storage")
+                                    activePhotoToken = null
+                                    photoBitmap = null
+                                    clearForegroundState()
                                     return@launch
                                 }
-                        photoBitmap = bitmap
+                        val photoBitmap = photo.first
+                        val photoCacheKey = photo.second
+                        val token =
+                            PhotoToken(
+                                photoCacheKey,
+                                Size(photoBitmap.width, photoBitmap.height),
+                            )
+                        activePhotoToken = token
+                        this@PortraitEngine.photoBitmap = photoBitmap
+                        clearForegroundState()
                         notifyWallpaperColorsChanged()
+                        updateShapeEffectState()
 
-                        val cachedFg = loadForegroundFromStorage()
+                        val cachedFg = loadForegroundFromStorage(token)
+                        if (!isActivePhoto(token)) return@launch
                         if (cachedFg != null) {
                             foregroundBitmap = cachedFg
                             publishDepthMask(cachedFg)
                             positionImage(cachedFg)
+                            if (!isActivePhoto(token)) return@launch
                             updateShapeEffectState()
                             return@launch
                         }
 
-                        updateShapeEffectState()
-                        runSegmentation(bitmap)
+                        runSegmentation(photoBitmap, token)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -425,21 +473,25 @@ class MagicPortraitService : LiveWallpaper() {
                 }
         }
 
-        private fun runSegmentation(bitmap: Bitmap) {
+        private fun runSegmentation(bitmap: Bitmap, token: PhotoToken) {
             segmentationJob?.cancel()
             segmentationJob =
                 scope.launch {
                     try {
-                        val segmenter = TFLiteImageSegmenter(context)
                         val fg =
-                            withContext(Dispatchers.IO) { segmenter.getForegroundImage(bitmap) }
+                            withContext(Dispatchers.IO) {
+                                TFLiteImageSegmenter(context).getForegroundImage(bitmap)
+                            }
+                        if (!isActivePhoto(token)) return@launch
                         foregroundBitmap = fg
 
-                        saveForegroundToStorage(fg)
+                        saveForegroundToStorage(fg, token.cacheKey)
+                        if (!isActivePhoto(token)) return@launch
 
                         publishDepthMask(fg)
 
                         positionImage(fg)
+                        if (!isActivePhoto(token)) return@launch
 
                         updateShapeEffectState()
                         Log.d(TAG, "Segmentation complete, foreground: ${fg.width}x${fg.height}")
@@ -449,6 +501,17 @@ class MagicPortraitService : LiveWallpaper() {
                         Log.e(TAG, "Segmentation failed", e)
                     }
                 }
+        }
+
+        private fun clearForegroundState() {
+            foregroundBitmap = null
+            positionModel = null
+            cachedDepthPathData = null
+            updateDepthState(false)
+        }
+
+        private fun isActivePhoto(token: PhotoToken): Boolean {
+            return activePhotoToken == token
         }
 
         private fun publishDepthMask(fg: Bitmap) {
@@ -461,51 +524,126 @@ class MagicPortraitService : LiveWallpaper() {
         }
 
         private fun updateDepthState(showDepth: Boolean) {
+            if (isPreview()) return
+
             val wantActive = showDepth && cachedDepthPathData != null
-            if (wantActive == depthMaskActive) return
+            val nextPath = if (wantActive) cachedDepthPathData else null
+            if (!wantActive && ownsDepthState && hasForeignDepthState()) {
+                ownsDepthState = false
+                depthMaskActive = false
+                activeDepthPathData = null
+                return
+            }
+
+            if (
+                ownsDepthState &&
+                    wantActive == depthMaskActive &&
+                    nextPath == activeDepthPathData
+            ) {
+                return
+            }
+
+            ownsDepthState = true
             depthMaskActive = wantActive
+            activeDepthPathData = nextPath
             try {
                 Settings.Secure.putString(
                     context.contentResolver,
                     SETTING_DEPTH_MASK,
-                    if (wantActive) cachedDepthPathData else null,
+                    nextPath,
                 )
                 Settings.Secure.putString(context.contentResolver, SETTING_DEPTH_BOUNDS, null)
             } catch (_: Exception) {}
         }
 
-        private fun positionImage(fg: Bitmap) {
-            val positioner = ForegroundPositionerImpl(shapePositionHelper)
-            positionModel = positioner.positionImage(fg)
+        private fun hasForeignDepthState(): Boolean {
+            return Settings.Secure.getString(context.contentResolver, SETTING_DEPTH_MASK) !=
+                activeDepthPathData
+        }
+
+        private suspend fun positionImage(fg: Bitmap) {
+            positionModel =
+                withContext(Dispatchers.Default) {
+                    val positioner = ForegroundPositionerImpl(shapePositionHelper)
+                    positioner.positionImage(fg)
+                }
             Log.d(TAG, "Position model: $positionModel")
         }
 
-        private suspend fun loadPhotoFromStorage(): Bitmap? =
+        private suspend fun loadPhotoFromStorage(): Pair<Bitmap, String>? =
             withContext(Dispatchers.IO) {
                 val deContext = context.createDeviceProtectedStorageContext()
                 val file = File(deContext.filesDir, PHOTO_FILE)
                 if (!file.exists()) return@withContext null
-                BitmapFactory.decodeFile(file.absolutePath)
+                val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: return@withContext null
+                Pair(bitmap, createForegroundCacheKey(file))
             }
 
-        private suspend fun loadForegroundFromStorage(): Bitmap? =
+        private suspend fun loadForegroundFromStorage(token: PhotoToken): Bitmap? =
             withContext(Dispatchers.IO) {
                 val deContext = context.createDeviceProtectedStorageContext()
                 val file = File(deContext.filesDir, FOREGROUND_FILE)
+                val metaFile = File(deContext.filesDir, FOREGROUND_META_FILE)
+                val legacyMetaFile = File(deContext.filesDir, LEGACY_FOREGROUND_META_FILE)
                 if (!file.exists()) return@withContext null
-                BitmapFactory.decodeFile(file.absolutePath)
+                val storedKey =
+                    if (metaFile.exists()) runCatching { metaFile.readText() }.getOrNull()
+                    else null
+                if (storedKey != token.cacheKey) {
+                    deleteForegroundCache(file, metaFile, legacyMetaFile)
+                    return@withContext null
+                }
+                val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: run {
+                    deleteForegroundCache(file, metaFile, legacyMetaFile)
+                    return@withContext null
+                }
+                if (
+                    bitmap.width != token.photoSize.width ||
+                        bitmap.height != token.photoSize.height
+                ) {
+                    bitmap.recycle()
+                    deleteForegroundCache(file, metaFile, legacyMetaFile)
+                    return@withContext null
+                }
+                bitmap
             }
 
-        private suspend fun saveForegroundToStorage(bitmap: Bitmap) =
+        private fun deleteForegroundCache(file: File, metaFile: File, legacyMetaFile: File) {
+            file.delete()
+            metaFile.delete()
+            legacyMetaFile.delete()
+        }
+
+        private suspend fun saveForegroundToStorage(bitmap: Bitmap, photoCacheKey: String) =
             withContext(Dispatchers.IO) {
                 try {
                     val deContext = context.createDeviceProtectedStorageContext()
                     val file = File(deContext.filesDir, FOREGROUND_FILE)
-                    file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    file.outputStream().use {
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
+                    }
+                    File(deContext.filesDir, FOREGROUND_META_FILE).writeText(photoCacheKey)
+                    File(deContext.filesDir, LEGACY_FOREGROUND_META_FILE).delete()
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to save foreground", e)
                 }
             }
+
+        private fun createForegroundCacheKey(file: File): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            val hash = digest.digest().joinToString("") {
+                ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1)
+            }
+            return "$FOREGROUND_CACHE_VERSION:${file.length()}:${file.lastModified()}:$hash"
+        }
 
         private fun updateShapeEffectState() {
             val bitmap = photoBitmap ?: return
@@ -531,10 +669,15 @@ class MagicPortraitService : LiveWallpaper() {
                             size,
                             Size(bitmap.width, bitmap.height),
                             shapePositionHelper,
-                            false,
+                            isRtl,
                         )
                     } else {
-                        CropHelper.centerAlign(size, Size(bitmap.width, bitmap.height))
+                        CropHelper.centerAlign(
+                            size,
+                            Size(bitmap.width, bitmap.height),
+                            true,
+                            isRtl,
+                        )
                     }
 
                 val state =
@@ -554,11 +697,8 @@ class MagicPortraitService : LiveWallpaper() {
                     computeShapeBoundsForDisplay(size, overlap, lockscreenBounds)
 
                 val crop =
-                    if (pm != null) {
-                        pm.getCropWithShape(size, bitmapSize, displayShapeBounds)
-                    } else {
-                        CropHelper.centerAlign(size, bitmapSize)
-                    }
+                    pm?.getCropWithShape(size, bitmapSize, displayShapeBounds)
+                        ?: CropHelper.centerAlign(size, bitmapSize)
 
                 val state =
                     ShapeEffectState.WithShape(
@@ -569,7 +709,7 @@ class MagicPortraitService : LiveWallpaper() {
                         shape = shape,
                         shapeChipColor = currentColor,
                         shapeColorSliderValue = currentLstar,
-                        shouldDrawForeground = pm?.shouldDrawForeground ?: false,
+                        shouldDrawForeground = fg != null && pm?.shouldDrawForeground == true,
                         shapeBounds = displayShapeBounds,
                         normalizedCutLine = pm?.normalizedCutLine,
                         rotationDirection = rotationDir,
@@ -625,7 +765,7 @@ class MagicPortraitService : LiveWallpaper() {
                 surfaceRect.top + (surfaceRect.height() - shapeRect.height()) / 2f,
             )
 
-            if (adjustedBounds.top > shapeRect.top || adjustedBounds.bottom < shapeRect.bottom) {
+            if (adjustedBounds.top <= shapeRect.top || adjustedBounds.bottom < shapeRect.bottom) {
                 val shift =
                     kotlin.math.min(
                         adjustedBounds.top - shapeRect.top,

@@ -48,6 +48,7 @@ class ForegroundEstimationInference(context: Context) : ModelInference(context) 
             val buffer = TensorBuffer.createFixedSize(shape, DataType.UINT8)
             buffer.buffer.rewind()
             scaled.copyPixelsToBuffer(buffer.buffer)
+            if (scaled !== maskBitmap) scaled.recycle()
 
             val processor =
                 TensorProcessor.Builder()

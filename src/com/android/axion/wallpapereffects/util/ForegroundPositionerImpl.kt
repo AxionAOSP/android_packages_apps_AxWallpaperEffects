@@ -167,15 +167,19 @@ class ForegroundPositionerImpl(private val shapePositionHelper: ShapePositionHel
                     "Trying zoom=$zoomPct, overlap=$overlapPct: top=$shapeBitmapTop, bottom=$shapeBitmapBottom",
                 )
 
-                if (shapeBitmapTop < 0 || shapeBitmapBottom > bitmapSize.height) {
-                    Log.v(TAG, "  => Shape outside bitmap vertically. Skipping.")
+                val shapeMargin = shapeHeight * 0.11f
+                if (
+                    shapeBitmapTop < shapeMargin ||
+                        shapeBitmapBottom > bitmapSize.height - shapeMargin
+                ) {
+                    Log.v(TAG, "  => Shape lacks vertical margin. Skipping.")
                     continue
                 }
 
                 val fgCenterX = foregroundBounds.centerX()
-                val halfSize = shapeSize / 2
-                val minCenterX = halfSize
-                val maxCenterX = bitmapSize.width - halfSize
+                val centerMargin = (shapeSize / 2f + 0.07f * shapeSize).roundToInt()
+                val minCenterX = centerMargin
+                val maxCenterX = bitmapSize.width - centerMargin
 
                 if (minCenterX > maxCenterX) continue
 
@@ -186,13 +190,12 @@ class ForegroundPositionerImpl(private val shapePositionHelper: ShapePositionHel
                         foregroundBounds,
                         strips,
                         stripHeight,
-                        bitmapSize,
                         shapeBitmapTop,
                         shapeBitmapBottom,
                         shapeSize,
                         preferredCenterX,
-                        fgCenterX,
-                        overlap,
+                        minCenterX,
+                        maxCenterX,
                     )
 
                 if (result != null) {
@@ -238,21 +241,18 @@ class ForegroundPositionerImpl(private val shapePositionHelper: ShapePositionHel
         fgBounds: Rect,
         strips: List<Pair<Int, Int>?>,
         stripHeight: Int,
-        bitmapSize: Size,
         shapeTop: Int,
         shapeBottom: Int,
         shapeSize: Int,
         preferredCenterX: Int,
-        fgCenterX: Int,
-        overlap: Float,
+        minCenterX: Int,
+        maxCenterX: Int,
     ): Pair<Rect, Float>? {
         val halfSize = shapeSize / 2
-        val minCenterX = halfSize
-        val maxCenterX = bitmapSize.width - halfSize
         val shapeCenter = (shapeTop + shapeBottom) / 2
         var bestPair: Pair<Rect, Float>? = null
 
-        var scanY = shapeCenter
+        var scanY = shapeCenter + (shapeSize * 0.25f).roundToInt()
         while (scanY >= shapeTop) {
             val normalizedY = ((scanY - shapeTop).toFloat() / shapeSize) - 0.5f
 
@@ -315,8 +315,8 @@ class ForegroundPositionerImpl(private val shapePositionHelper: ShapePositionHel
             return it
         }
 
-        var tightLeft = Float.MIN_VALUE
-        var tightRight = Float.MAX_VALUE
+        var tightLeft = Float.NEGATIVE_INFINITY
+        var tightRight = Float.POSITIVE_INFINITY
         for (shape in Shape.AVAILABLE_SHAPES) {
             val bounds = shape.horizontalBounds(normalizedY)
             if (bounds != null) {

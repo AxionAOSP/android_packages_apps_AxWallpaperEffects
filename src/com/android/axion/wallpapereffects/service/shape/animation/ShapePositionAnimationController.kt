@@ -32,6 +32,7 @@ import com.android.axion.wallpapereffects.service.shape.ShapeRenderModel
 import com.android.axion.wallpapereffects.util.RectUtils
 import com.android.axion.wallpapereffects.util.ShapePositionHelper
 import kotlin.math.min
+import kotlin.math.roundToLong
 
 class ShapePositionAnimationController(
     private val callback: ShapeRendererCallback,
@@ -146,12 +147,14 @@ class ShapePositionAnimationController(
             val scaledBounds = RectUtils.scaleAround(current.shapeBounds, center, scaleFactor)
             val tapTarget = current.copy(shapeBounds = scaledBounds)
 
-            val progress = getTapAnimationScaleProgress()
-            val endInterpolator = ShapeEffectConstants.createTapEndInterpolator(progress)
+            val progress = min(1f, (currentScale - 1f) / 0.08000004f)
+            val duration = 250 + (-50.0 * progress).roundToLong()
+            val endInterpolator =
+                ShapeEffectConstants.createTapEndInterpolator(getTapAnimationScaleProgress())
 
             startShapeAnimator(
                 tapTarget,
-                ShapeEffectConstants.TAP_ANIMATION_DURATION_MS,
+                duration,
                 ShapeEffectConstants.SHAPE_BITMAP_TAP_ANIMATION_INTERPOLATOR,
                 true,
             ) {
@@ -172,6 +175,7 @@ class ShapePositionAnimationController(
         currentState = null
         stableState = null
         targetState = null
+        isTapAnimationRunning = false
     }
 
     private fun startShapeAnimator(

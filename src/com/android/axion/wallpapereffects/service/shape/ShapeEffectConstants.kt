@@ -16,6 +16,7 @@
 
 package com.android.axion.wallpapereffects.service.shape
 
+import android.graphics.Path
 import android.os.VibrationEffect
 import android.view.animation.Interpolator
 import android.view.animation.LinearInterpolator
@@ -25,7 +26,7 @@ import android.view.animation.PathInterpolator
 object ShapeEffectConstants {
 
     val SHAPE_BITMAP_ANIMATION_INTERPOLATOR: Interpolator =
-        PathInterpolator(0.05f, 0.7f, 0.1f, 1.0f)
+        createEmphasizedInterpolator()
 
     val SHAPE_BITMAP_TAP_ANIMATION_INTERPOLATOR: Interpolator =
         PathInterpolator(0.26873f, 0f, 0.45042f, 1f)
@@ -55,5 +56,13 @@ object ShapeEffectConstants {
             val overshoot = SHAPE_BITMAP_TAP_ANIMATION_MAX_END_INTERPOLATOR.getInterpolation(input)
             base + (overshoot - base) * scaleProgress
         }
+    }
+
+    private fun createEmphasizedInterpolator(): Interpolator {
+        val path = Path()
+        path.moveTo(0f, 0f)
+        path.cubicTo(0.05f, 0f, 0.133333f, 0.06f, 0.166666f, 0.4f)
+        path.cubicTo(0.208333f, 0.82f, 0.25f, 1f, 1f, 1f)
+        return PathInterpolator(path)
     }
 }

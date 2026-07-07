@@ -44,7 +44,8 @@ class BitmapPositionAnimationController(
     private var currentPosition: Position? = null
     private var stablePosition: Position? = null
     private var targetPosition: Position? = null
-    private var isTapAnimationRunning = false
+    var isTapAnimationRunning = false
+        private set
 
     data class Position(
         val xOffsetForParallax: Float,
@@ -143,12 +144,13 @@ class BitmapPositionAnimationController(
 
             val shapeProgress = shapePositionController.getTapAnimationScaleProgress()
             val progress = max(shapeProgress, min(1f, (scale - 1f) / 0.08000004f))
+            val duration = 250 + (-50.0 * progress).roundToLong()
             val startDelay = 100 + (-100.0 * progress).roundToLong()
             val endInterpolator = ShapeEffectConstants.createTapEndInterpolator(progress)
 
             startMatrixAnimator(
                 tapTarget,
-                ShapeEffectConstants.TAP_ANIMATION_DURATION_MS,
+                duration,
                 ShapeEffectConstants.SHAPE_BITMAP_TAP_ANIMATION_INTERPOLATOR,
                 true,
                 startDelay,
@@ -171,6 +173,7 @@ class BitmapPositionAnimationController(
         currentPosition = null
         stablePosition = null
         targetPosition = null
+        isTapAnimationRunning = false
     }
 
     private fun startMatrixAnimator(

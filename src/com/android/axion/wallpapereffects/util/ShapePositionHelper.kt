@@ -63,7 +63,7 @@ class ShapePositionHelper(context: Context) {
         val sizes = mutableListOf<Size>()
         var largestMetrics: DisplayMetrics? = null
         var secondMetrics: DisplayMetrics? = null
-        var largestArea = Float.MIN_VALUE
+        var largestArea = 0f
 
         for (display in builtInDisplays) {
             val metrics = DisplayMetrics()

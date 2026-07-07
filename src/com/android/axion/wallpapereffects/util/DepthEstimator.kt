@@ -96,7 +96,7 @@ class DepthEstimator(private val context: Context) {
 
             val depthValues = FloatArray(outputH * outputW)
             var minDepth = Float.MAX_VALUE
-            var maxDepth = Float.MIN_VALUE
+            var maxDepth = Float.NEGATIVE_INFINITY
             for (i in depthValues.indices) {
                 val d = outputBuffer.getFloat()
                 depthValues[i] = d

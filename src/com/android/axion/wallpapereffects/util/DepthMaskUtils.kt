@@ -103,6 +103,12 @@ object DepthMaskUtils {
             return null
         }
 
+        val subjectCount = keepLargestComponent(mask, extractW, extractH)
+        if (subjectCount.toFloat() / pixels.size < MIN_SUBJECT_RATIO) {
+            Log.d(TAG, "No significant connected subject ($subjectCount/${pixels.size} fg pixels)")
+            return null
+        }
+
         fillInternalHoles(mask, extractW, extractH)
 
         val region = Region()
@@ -319,5 +325,74 @@ object DepthMaskUtils {
                 mask[i] = true
             }
         }
+    }
+
+    private fun keepLargestComponent(mask: BooleanArray, w: Int, h: Int): Int {
+        val visited = BooleanArray(mask.size)
+        val labels = IntArray(mask.size)
+        val queue = IntArray(mask.size)
+        var label = 0
+        var bestLabel = 0
+        var bestCount = 0
+
+        for (start in mask.indices) {
+            if (!mask[start] || visited[start]) continue
+
+            label++
+            var head = 0
+            var tail = 0
+            var count = 0
+            visited[start] = true
+            queue[tail++] = start
+
+            while (head < tail) {
+                val idx = queue[head++]
+                labels[idx] = label
+                count++
+
+                val x = idx % w
+                val y = idx / w
+                if (x > 0) {
+                    tail = addComponentPixel(idx - 1, mask, visited, queue, tail)
+                }
+                if (x < w - 1) {
+                    tail = addComponentPixel(idx + 1, mask, visited, queue, tail)
+                }
+                if (y > 0) {
+                    tail = addComponentPixel(idx - w, mask, visited, queue, tail)
+                }
+                if (y < h - 1) {
+                    tail = addComponentPixel(idx + w, mask, visited, queue, tail)
+                }
+            }
+
+            if (count > bestCount) {
+                bestCount = count
+                bestLabel = label
+            }
+        }
+
+        if (bestCount == 0) return 0
+
+        for (i in mask.indices) {
+            if (labels[i] != bestLabel) {
+                mask[i] = false
+            }
+        }
+
+        return bestCount
+    }
+
+    private fun addComponentPixel(
+        idx: Int,
+        mask: BooleanArray,
+        visited: BooleanArray,
+        queue: IntArray,
+        tail: Int,
+    ): Int {
+        if (!mask[idx] || visited[idx]) return tail
+        visited[idx] = true
+        queue[tail] = idx
+        return tail + 1
     }
 }

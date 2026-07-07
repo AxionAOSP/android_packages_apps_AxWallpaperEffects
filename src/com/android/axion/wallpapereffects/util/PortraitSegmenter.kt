@@ -39,7 +39,7 @@ import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 
 private const val TAG = "PortraitSegmenter"
 private const val RAID_MODEL = "mobile_bg_removal_mosaic_dm1_w_metadata.f16.tflite"
-private const val DEEP_MATTING_MODEL = "deep_matting.tflite"
+private const val MATTING_MODEL = "portrait_matting_mask_1024_768.tflite"
 private const val FG_ESTIMATION_MODEL = "foreground_estimator_5680_512_512.tflite"
 private const val MODELS_DIR = "segmentation_models_v2"
 
@@ -59,10 +59,10 @@ class PortraitSegmenter(private val context: Context) {
             return
         }
         try {
-            mattingModelFile = cacheModel(DEEP_MATTING_MODEL)
-            Log.d(TAG, "Deep matting model ready: ${mattingModelFile!!.length()} bytes")
+            mattingModelFile = cacheModel(MATTING_MODEL)
+            Log.d(TAG, "Matting model ready: ${mattingModelFile!!.length()} bytes")
         } catch (e: Exception) {
-            Log.w(TAG, "Deep matting model not available", e)
+            Log.w(TAG, "Matting model not available", e)
         }
         try {
             fgEstModelFile = cacheModel(FG_ESTIMATION_MODEL)
@@ -122,7 +122,10 @@ class PortraitSegmenter(private val context: Context) {
             val mattingOutputBuffers = HashMap<Int, TensorBuffer>()
             val confidenceBitmap: Bitmap
             val refinedAlpha: Bitmap
-            val mattingOutputShape: IntArray
+            val confidenceOutputShape: IntArray
+            val confidenceOutputIndex: Int
+            val alphaOutputShape: IntArray
+            val alphaOutputIndex: Int
             Interpreter(mattingModelFile!!, interpreterOptions).use { matting ->
                 val mattingInputImage = convertMattingImageInput(matting, bitmap)
                 val mattingMaskBuffer = convertMaskToInputBuffer(matting, coarseMask)
@@ -131,15 +134,26 @@ class PortraitSegmenter(private val context: Context) {
                     arrayOf(mattingInputImage.tensorBuffer.buffer, mattingMaskBuffer),
                     mattingOutputBuffers,
                 )
-                mattingOutputShape = matting.getOutputTensor(0).shape()
+                val outputIndexes = getMattingOutputIndexes(matting)
+                confidenceOutputIndex = outputIndexes.first
+                alphaOutputIndex = outputIndexes.second
+                confidenceOutputShape = matting.getOutputTensor(confidenceOutputIndex).shape()
+                alphaOutputShape = matting.getOutputTensor(alphaOutputIndex).shape()
             }
-            val mattingResult = convertMattingOutput(mattingOutputBuffers, mattingOutputShape)
+            val mattingResult =
+                convertMattingOutput(
+                    mattingOutputBuffers,
+                    confidenceOutputIndex,
+                    confidenceOutputShape,
+                    alphaOutputIndex,
+                    alphaOutputShape,
+                )
             confidenceBitmap = mattingResult.first
             refinedAlpha = mattingResult.second
             coarseMask.recycle()
             Log.d(
                 TAG,
-                "Stage 2 DeepMatting: alpha ${refinedAlpha.width}x${refinedAlpha.height}" +
+                "Stage 2 Matting: alpha ${refinedAlpha.width}x${refinedAlpha.height}" +
                     " (${System.currentTimeMillis() - t2}ms)",
             )
 
@@ -230,8 +244,8 @@ class PortraitSegmenter(private val context: Context) {
                 .build()
         val processed = processor.process(tensorBuffer)
 
-        val w = shape[1]
-        val h = shape[2]
+        val h = shape[1]
+        val w = shape[2]
         processed.buffer.rewind()
         val mask = Bitmap.createBitmap(w, h, Bitmap.Config.ALPHA_8)
         mask.copyPixelsFromBuffer(processed.buffer)
@@ -257,7 +271,7 @@ class PortraitSegmenter(private val context: Context) {
 
     private fun convertMaskToInputBuffer(interp: Interpreter, mask: Bitmap): ByteBuffer {
         val shape = interp.getInputTensor(1).shape()
-        val scaled = Bitmap.createScaledBitmap(mask, shape[1], shape[2], true)
+        val scaled = Bitmap.createScaledBitmap(mask, shape[2], shape[1], true)
         val tensorBuffer = TensorBuffer.createFixedSize(shape, DataType.UINT8)
         tensorBuffer.buffer.rewind()
         scaled.copyPixelsToBuffer(tensorBuffer.buffer)
@@ -273,34 +287,59 @@ class PortraitSegmenter(private val context: Context) {
 
     private fun convertMattingOutput(
         outputBuffers: HashMap<Int, TensorBuffer>,
-        shape: IntArray,
+        confidenceOutputIndex: Int,
+        confidenceShape: IntArray,
+        alphaOutputIndex: Int,
+        alphaShape: IntArray,
     ): Pair<Bitmap, Bitmap> {
-        val w = shape[1]
-        val h = shape[2]
-        val buffer = outputBuffers[0]!!.buffer
+        val confidenceBitmap = convertConfidenceOutput(
+            outputBuffers[confidenceOutputIndex]!!,
+            confidenceShape,
+        )
+        val refinedAlpha = convertAlphaOutput(outputBuffers[alphaOutputIndex]!!, alphaShape)
+        return Pair(confidenceBitmap, refinedAlpha)
+    }
+
+    private fun convertConfidenceOutput(tensorBuffer: TensorBuffer, shape: IntArray): Bitmap {
+        val h = shape[1]
+        val w = shape[2]
+        val buffer = tensorBuffer.buffer
         buffer.rewind()
 
         val totalFloats = shape.reduce { acc, v -> acc * v }
-
         val confidenceBuffer =
             ByteBuffer.allocateDirect(4 * totalFloats).order(ByteOrder.nativeOrder())
-        val alphaBuffer = ByteBuffer.allocateDirect(totalFloats).order(ByteOrder.nativeOrder())
 
         while (buffer.hasRemaining()) {
             val f = buffer.float
             confidenceBuffer.putInt(Color.argb(if (f > 0.99f) 1f else 0f, 0f, 0f, 0f))
-            alphaBuffer.put((f * 255f).roundToInt().toByte())
         }
 
         confidenceBuffer.rewind()
         val confidenceBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         confidenceBitmap.copyPixelsFromBuffer(confidenceBuffer)
+        return confidenceBitmap
+    }
+
+    private fun convertAlphaOutput(tensorBuffer: TensorBuffer, shape: IntArray): Bitmap {
+        val h = shape[1]
+        val w = shape[2]
+        val buffer = tensorBuffer.buffer
+        buffer.rewind()
+
+        val totalFloats = shape.reduce { acc, v -> acc * v }
+        val alphaBuffer = ByteBuffer.allocateDirect(totalFloats).order(ByteOrder.nativeOrder())
+
+        while (buffer.hasRemaining()) {
+            val f = buffer.float
+            val alpha = (f.coerceIn(0f, 1f) * 255f).roundToInt()
+            alphaBuffer.put(alpha.toByte())
+        }
 
         alphaBuffer.rewind()
         val refinedAlpha = Bitmap.createBitmap(w, h, Bitmap.Config.ALPHA_8)
         refinedAlpha.copyPixelsFromBuffer(alphaBuffer)
-
-        return Pair(confidenceBitmap, refinedAlpha)
+        return refinedAlpha
     }
 
     private fun normalizeFgEstInput(raidInput: TensorImage): TensorImage {
@@ -317,7 +356,7 @@ class PortraitSegmenter(private val context: Context) {
 
     private fun convertMaskToInputTensor(interp: Interpreter, mask: Bitmap): TensorBuffer {
         val shape = interp.getInputTensor(1).shape()
-        val scaled = Bitmap.createScaledBitmap(mask, shape[1], shape[2], true)
+        val scaled = Bitmap.createScaledBitmap(mask, shape[2], shape[1], true)
         val tensorBuffer = TensorBuffer.createFixedSize(shape, DataType.UINT8)
         tensorBuffer.buffer.rewind()
         scaled.copyPixelsToBuffer(tensorBuffer.buffer)
@@ -334,8 +373,8 @@ class PortraitSegmenter(private val context: Context) {
     private fun getMaskedFGColors(fgTensor: TensorBuffer, maskTensor: TensorBuffer): Bitmap {
         val fgBuffer = fgTensor.buffer
         val maskBuffer = maskTensor.buffer
-        val w = fgTensor.shape[1]
-        val h = fgTensor.shape[2]
+        val h = fgTensor.shape[1]
+        val w = fgTensor.shape[2]
         fgBuffer.rewind()
         maskBuffer.rewind()
 
@@ -375,8 +414,8 @@ class PortraitSegmenter(private val context: Context) {
                 shape = interp.getOutputTensor(maskIdx).shape()
             }
 
-            val maskW = shape[1]
-            val maskH = shape[2]
+            val maskH = shape[1]
+            val maskW = shape[2]
             val buf = raidOutputBuffers[maskIdx]!!.buffer
             buf.rewind()
 
@@ -502,6 +541,27 @@ class PortraitSegmenter(private val context: Context) {
 
         bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
         return bitmap
+    }
+
+    private fun getMattingOutputIndexes(interp: Interpreter): Pair<Int, Int> {
+        var alphaOutputIndex = 0
+        var alphaOutputSize = 0
+        var confidenceOutputIndex = 0
+        var confidenceOutputSize = Int.MAX_VALUE
+        for (i in 0 until interp.outputTensorCount) {
+            val outputSize = interp.getOutputTensor(i).shape().fold(1) { acc, value ->
+                acc * value
+            }
+            if (outputSize > alphaOutputSize) {
+                alphaOutputIndex = i
+                alphaOutputSize = outputSize
+            }
+            if (outputSize < confidenceOutputSize) {
+                confidenceOutputIndex = i
+                confidenceOutputSize = outputSize
+            }
+        }
+        return Pair(confidenceOutputIndex, alphaOutputIndex)
     }
 
     fun extractCompactMask(segmented: Bitmap): String? {

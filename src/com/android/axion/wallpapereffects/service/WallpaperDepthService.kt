@@ -47,6 +47,8 @@ class WallpaperDepthService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
     private var processingThread: Thread? = null
+    @Volatile
+    private var currentProcessToken: ProcessToken? = null
     private var lastScreenW = 0
     private var lastScreenH = 0
 
@@ -106,32 +108,39 @@ class WallpaperDepthService : Service() {
         Log.d(TAG, "onDestroy")
         WallpaperManager.getInstance(this).removeOnColorsChangedListener(colorsListener)
         contentResolver.unregisterContentObserver(enabledObserver)
+        currentProcessToken = null
         processingThread?.interrupt()
         super.onDestroy()
     }
 
     private fun scheduleProcess() {
-
+        val token = ProcessToken()
+        currentProcessToken = token
         processingThread?.interrupt()
-        processingThread =
+        val thread =
             Thread {
-                    try {
-                        processWallpaper()
-                    } catch (e: InterruptedException) {
-                        Log.d(TAG, "Processing interrupted")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to process wallpaper depth", e)
+                try {
+                    processWallpaper(token)
+                } catch (e: InterruptedException) {
+                    Log.d(TAG, "Processing interrupted")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to process wallpaper depth", e)
+                    if (isCurrentProcess(token)) {
                         clearMask()
                     }
                 }
-                .also { it.start() }
+            }
+        processingThread = thread
+        thread.start()
     }
 
-    private fun processWallpaper() {
+    private fun processWallpaper(token: ProcessToken) {
         val enabled = Settings.Secure.getInt(contentResolver, SETTING_DEPTH_ENABLED, 0)
         if (enabled != 1) {
             Log.d(TAG, "Depth clock disabled (enabled=$enabled), clearing stale mask")
-            clearMask()
+            if (isCurrentProcess(token)) {
+                clearMask()
+            }
             return
         }
 
@@ -152,13 +161,17 @@ class WallpaperDepthService : Service() {
             return
         }
 
-        clearMask()
+        if (isCurrentProcess(token)) {
+            clearMask()
+        }
 
         val bitmap =
             loadWallpaperBitmap(wm, isLiveWallpaper, isEffectsWallpaper, hasLockWallpaper)
                 ?: run {
                     Log.w(TAG, "Could not load wallpaper bitmap")
-                    clearMask()
+                    if (isCurrentProcess(token)) {
+                        clearMask()
+                    }
                     return
                 }
         Log.d(TAG, "Loaded wallpaper bitmap: ${bitmap.width}x${bitmap.height}")
@@ -183,7 +196,9 @@ class WallpaperDepthService : Service() {
                     TAG,
                     "Path extraction: ${if (pathData != null) "${pathData.length} chars" else "null (no subject)"}",
                 )
-                if (pathData != null) {
+                if (!isCurrentProcess(token)) {
+                    Log.d(TAG, "Skipping stale depth result")
+                } else if (pathData != null) {
                     Settings.Secure.putString(contentResolver, SETTING_DEPTH_MASK, pathData)
                     Settings.Secure.putString(contentResolver, SETTING_DEPTH_BOUNDS, null)
                     Log.d(TAG, "Published depth path (${pathData.length} chars)")
@@ -193,12 +208,18 @@ class WallpaperDepthService : Service() {
                 fg.recycle()
             } else {
                 Log.d(TAG, "No subject detected in wallpaper")
-                clearMask()
+                if (isCurrentProcess(token)) {
+                    clearMask()
+                }
             }
         } finally {
             segmenter.release()
             if (!cropped.isRecycled) cropped.recycle()
         }
+    }
+
+    private fun isCurrentProcess(token: ProcessToken): Boolean {
+        return token == currentProcessToken && !Thread.currentThread().isInterrupted
     }
 
     private fun loadWallpaperBitmap(
@@ -344,4 +365,6 @@ class WallpaperDepthService : Service() {
             Settings.Secure.putString(contentResolver, SETTING_DEPTH_BOUNDS, null)
         } catch (_: Exception) {}
     }
+
+    private data class ProcessToken(val marker: Any = Any())
 }

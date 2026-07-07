@@ -56,64 +56,68 @@ class ShapeRenderer {
             canvas.translate(-canvas.width / 2f, -canvas.height / 2f)
         }
 
-        val model = shapeRenderModel
-        if (model == null) {
-            Log.w(TAG, "Skipping drawing frame: shapeRenderModel is null.")
-            return
-        }
-
-        when (model) {
-            is ShapeRenderModel.WithoutShape -> {
-                val tracing = Trace.isTagEnabled(Trace.TRACE_TAG_APP)
-                if (tracing) Trace.traceBegin(Trace.TRACE_TAG_APP, "ShapeRenderer#drawFrame")
-                try {
-                    canvas.drawBitmap(model.bitmap, model.matrix, null)
-                } finally {
-                    if (tracing) Trace.traceEnd(Trace.TRACE_TAG_APP)
-                }
+        try {
+            val model = shapeRenderModel
+            if (model == null) {
+                Log.w(TAG, "Skipping drawing frame: shapeRenderModel is null.")
+                return
             }
-            is ShapeRenderModel.WithShape -> {
-                val tracing = Trace.isTagEnabled(Trace.TRACE_TAG_APP)
-                if (tracing)
-                    Trace.traceBegin(Trace.TRACE_TAG_APP, "ShapeRenderer#drawFrameWithShape")
-                try {
 
-                    canvas.drawColor(model.shapeColor)
-
-                    canvas.save()
-                    val transformedPath = Path()
-                    model.shapePath.transform(model.shapeMatrix, transformedPath)
-                    canvas.clipPath(transformedPath)
-                    canvas.drawBitmap(model.bitmap, model.matrix, null)
-                    canvas.restore()
-
-                    if (
-                        model.shouldDrawForeground &&
-                            model.segmentationModel is SegmentationModel.Loaded &&
-                            model.foregroundAlpha > 0f
-                    ) {
-                        canvas.save()
-                        val cutLine = model.normalizedCutLine ?: 0f
-                        val cutRect = RectF(-1f, -1f, -1f, cutLine)
-                        model.shapeMatrix.mapRect(cutRect)
-                        cutRect.left = 0f
-                        cutRect.top = 0f
-                        cutRect.right = model.surfaceSize.width.toFloat()
-                        canvas.clipRect(cutRect)
-
-                        val paint =
-                            Paint().apply { alpha = (model.foregroundAlpha * 255f).roundToInt() }
-                        canvas.drawBitmap(model.segmentationModel.bitmap, model.matrix, paint)
-                        canvas.restore()
+            when (model) {
+                is ShapeRenderModel.WithoutShape -> {
+                    val tracing = Trace.isTagEnabled(Trace.TRACE_TAG_APP)
+                    if (tracing) Trace.traceBegin(Trace.TRACE_TAG_APP, "ShapeRenderer#drawFrame")
+                    try {
+                        canvas.drawBitmap(model.bitmap, model.matrix, null)
+                    } finally {
+                        if (tracing) Trace.traceEnd(Trace.TRACE_TAG_APP)
                     }
-                } finally {
-                    if (tracing) Trace.traceEnd(Trace.TRACE_TAG_APP)
+                }
+                is ShapeRenderModel.WithShape -> {
+                    val tracing = Trace.isTagEnabled(Trace.TRACE_TAG_APP)
+                    if (tracing)
+                        Trace.traceBegin(Trace.TRACE_TAG_APP, "ShapeRenderer#drawFrameWithShape")
+                    try {
+
+                        canvas.drawColor(model.shapeColor)
+
+                        canvas.save()
+                        val transformedPath = Path()
+                        model.shapePath.transform(model.shapeMatrix, transformedPath)
+                        canvas.clipPath(transformedPath)
+                        canvas.drawBitmap(model.bitmap, model.matrix, null)
+                        canvas.restore()
+
+                        if (
+                            model.shouldDrawForeground &&
+                                model.segmentationModel is SegmentationModel.Loaded &&
+                                model.foregroundAlpha > 0f
+                        ) {
+                            canvas.save()
+                            val cutLine = model.normalizedCutLine ?: 0f
+                            val cutRect = RectF(-1f, -1f, -1f, cutLine)
+                            model.shapeMatrix.mapRect(cutRect)
+                            cutRect.left = 0f
+                            cutRect.top = 0f
+                            cutRect.right = model.surfaceSize.width.toFloat()
+                            canvas.clipRect(cutRect)
+
+                            val paint =
+                                Paint().apply {
+                                    alpha = (model.foregroundAlpha * 255f).roundToInt()
+                                }
+                            canvas.drawBitmap(model.segmentationModel.bitmap, model.matrix, paint)
+                            canvas.restore()
+                        }
+                    } finally {
+                        if (tracing) Trace.traceEnd(Trace.TRACE_TAG_APP)
+                    }
                 }
             }
-        }
-
-        if (!noScale) {
-            canvas.restore()
+        } finally {
+            if (!noScale) {
+                canvas.restore()
+            }
         }
     }
 

@@ -78,7 +78,6 @@ enum class Shape {
 
         val bounds = RectF()
         intersection.computeBounds(bounds, true)
-        if (bounds.isEmpty) return null
 
         return Pair(bounds.left, bounds.right)
     }
