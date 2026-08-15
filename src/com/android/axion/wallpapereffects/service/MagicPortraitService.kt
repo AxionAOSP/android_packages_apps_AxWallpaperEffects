@@ -37,6 +37,7 @@ import android.util.Size
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.View
+import com.android.axion.util.DisplayUtils
 import com.android.axion.wallpapereffects.generateeffect.bgseparation.TFLiteImageSegmenter
 import com.android.axion.wallpapereffects.service.shape.RotationDirection
 import com.android.axion.wallpapereffects.service.shape.SegmentationModel
@@ -143,6 +144,8 @@ class MagicPortraitService : LiveWallpaper() {
 
         private var cachedDepthPathData: String? = null
         private var activeDepthPathData: String? = null
+        private var activeDepthMaskSetting: String? = null
+        private var activeDepthBoundsSetting: String? = null
         private var depthMaskActive = false
         private var ownsDepthState = false
 
@@ -526,19 +529,29 @@ class MagicPortraitService : LiveWallpaper() {
         private fun updateDepthState(showDepth: Boolean) {
             if (isPreview()) return
 
+            val layout = DisplayUtils.getCurrentDisplayLayout(context)
+            val maskSetting = layout.getSettingName(SETTING_DEPTH_MASK)
+            val boundsSetting = layout.getSettingName(SETTING_DEPTH_BOUNDS)
+            if (ownsDepthState && activeDepthMaskSetting != maskSetting) {
+                releaseDepthState()
+            }
+
             val wantActive = showDepth && cachedDepthPathData != null
             val nextPath = if (wantActive) cachedDepthPathData else null
-            if (!wantActive && ownsDepthState && hasForeignDepthState()) {
+            if (!wantActive && ownsDepthState && hasForeignDepthState(maskSetting)) {
                 ownsDepthState = false
                 depthMaskActive = false
                 activeDepthPathData = null
+                activeDepthMaskSetting = null
+                activeDepthBoundsSetting = null
                 return
             }
 
             if (
                 ownsDepthState &&
                     wantActive == depthMaskActive &&
-                    nextPath == activeDepthPathData
+                    nextPath == activeDepthPathData &&
+                    activeDepthMaskSetting == maskSetting
             ) {
                 return
             }
@@ -546,19 +559,42 @@ class MagicPortraitService : LiveWallpaper() {
             ownsDepthState = true
             depthMaskActive = wantActive
             activeDepthPathData = nextPath
+            activeDepthMaskSetting = maskSetting
+            activeDepthBoundsSetting = boundsSetting
             try {
                 Settings.Secure.putString(
                     context.contentResolver,
-                    SETTING_DEPTH_MASK,
+                    maskSetting,
                     nextPath,
                 )
-                Settings.Secure.putString(context.contentResolver, SETTING_DEPTH_BOUNDS, null)
+                Settings.Secure.putString(context.contentResolver, boundsSetting, null)
             } catch (_: Exception) {}
         }
 
-        private fun hasForeignDepthState(): Boolean {
-            return Settings.Secure.getString(context.contentResolver, SETTING_DEPTH_MASK) !=
+        private fun hasForeignDepthState(maskSetting: String): Boolean {
+            return Settings.Secure.getString(context.contentResolver, maskSetting) !=
                 activeDepthPathData
+        }
+
+        private fun releaseDepthState() {
+            val maskSetting = activeDepthMaskSetting
+            try {
+                if (
+                    maskSetting != null &&
+                        Settings.Secure.getString(context.contentResolver, maskSetting) ==
+                            activeDepthPathData
+                ) {
+                    Settings.Secure.putString(context.contentResolver, maskSetting, null)
+                    activeDepthBoundsSetting?.let {
+                        Settings.Secure.putString(context.contentResolver, it, null)
+                    }
+                }
+            } catch (_: Exception) {}
+            ownsDepthState = false
+            depthMaskActive = false
+            activeDepthPathData = null
+            activeDepthMaskSetting = null
+            activeDepthBoundsSetting = null
         }
 
         private suspend fun positionImage(fg: Bitmap) {

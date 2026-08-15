@@ -31,7 +31,9 @@ import android.os.IBinder
 import android.os.Looper
 import android.provider.Settings
 import android.util.Log
-import android.view.WindowManager
+import com.android.axion.util.DisplayUtils
+import com.android.axion.util.DisplayUtils.DisplayLayout
+import com.android.axion.util.DisplayUtils.DisplayLayoutTarget
 import com.android.axion.wallpapereffects.util.DepthMaskUtils
 import com.android.axion.wallpapereffects.util.PortraitSegmenter
 import java.io.File
@@ -126,7 +128,7 @@ class WallpaperDepthService : Service() {
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to process wallpaper depth", e)
                     if (isCurrentProcess(token)) {
-                        clearMask()
+                        clearAllMasks()
                     }
                 }
             }
@@ -139,7 +141,7 @@ class WallpaperDepthService : Service() {
         if (enabled != 1) {
             Log.d(TAG, "Depth clock disabled (enabled=$enabled), clearing stale mask")
             if (isCurrentProcess(token)) {
-                clearMask()
+                clearAllMasks()
             }
             return
         }
@@ -161,60 +163,50 @@ class WallpaperDepthService : Service() {
             return
         }
 
-        if (isCurrentProcess(token)) {
-            clearMask()
-        }
+        val targets = DisplayUtils.getDisplayLayoutTargets(this)
+        if (isCurrentProcess(token)) clearAllMasks()
 
-        val bitmap =
+        val wallpaper =
             loadWallpaperBitmap(wm, isLiveWallpaper, isEffectsWallpaper, hasLockWallpaper)
                 ?: run {
                     Log.w(TAG, "Could not load wallpaper bitmap")
-                    if (isCurrentProcess(token)) {
-                        clearMask()
-                    }
                     return
                 }
+        val bitmap = wallpaper.bitmap
         Log.d(TAG, "Loaded wallpaper bitmap: ${bitmap.width}x${bitmap.height}")
-
-        val cropped = centerCropToDisplay(bitmap)
-        if (cropped !== bitmap && !bitmap.isRecycled) bitmap.recycle()
-        Log.d(TAG, "Cropped bitmap: ${cropped.width}x${cropped.height}")
 
         val segmenter = PortraitSegmenter(this)
         segmenter.init()
         Log.d(TAG, "Segmenter initialized, running segmentation...")
 
         try {
-            val fg = segmenter.segment(cropped)
-            Log.d(
-                TAG,
-                "Segmentation result: fg=${if (fg != null) "${fg.width}x${fg.height}" else "null"}",
-            )
-            if (fg != null) {
-                val pathData = DepthMaskUtils.extractSubjectPath(fg)
+            val fg = segmenter.segment(bitmap)
+            try {
                 Log.d(
                     TAG,
-                    "Path extraction: ${if (pathData != null) "${pathData.length} chars" else "null (no subject)"}",
+                    "Segmentation result: " +
+                        if (fg == null) "fg=null" else "fg=${fg.width}x${fg.height}",
                 )
-                if (!isCurrentProcess(token)) {
-                    Log.d(TAG, "Skipping stale depth result")
-                } else if (pathData != null) {
-                    Settings.Secure.putString(contentResolver, SETTING_DEPTH_MASK, pathData)
-                    Settings.Secure.putString(contentResolver, SETTING_DEPTH_BOUNDS, null)
-                    Log.d(TAG, "Published depth path (${pathData.length} chars)")
+                if (fg != null) {
+                    val cropRects = resolveCropRects(wm, wallpaper, targets)
+                    val paths =
+                        targets.mapIndexed { index, target ->
+                            target to extractPath(fg, cropRects[index])
+                        }
+                    if (isCurrentProcess(token)) {
+                        publishPaths(paths)
+                    } else {
+                        Log.d(TAG, "Skipping stale depth result")
+                    }
                 } else {
-                    clearMask()
+                    Log.d(TAG, "No subject detected in wallpaper")
                 }
-                fg.recycle()
-            } else {
-                Log.d(TAG, "No subject detected in wallpaper")
-                if (isCurrentProcess(token)) {
-                    clearMask()
-                }
+            } finally {
+                fg?.recycle()
             }
         } finally {
             segmenter.release()
-            if (!cropped.isRecycled) cropped.recycle()
+            if (!bitmap.isRecycled) bitmap.recycle()
         }
     }
 
@@ -227,25 +219,19 @@ class WallpaperDepthService : Service() {
         isLiveWallpaper: Boolean,
         isEffectsWallpaper: Boolean,
         hasLockWallpaper: Boolean,
-    ): Bitmap? {
+    ): LoadedWallpaper? {
         if (hasLockWallpaper) {
-            try {
-                wm.getWallpaperFile(WallpaperManager.FLAG_LOCK)?.use { lockPfd ->
-                    val bmp = BitmapFactory.decodeFileDescriptor(lockPfd.fileDescriptor)
-                    if (bmp != null) {
-                        Log.d(TAG, "Lock wallpaper: ${bmp.width}x${bmp.height}")
-                        return bmp
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Lock wallpaper load failed", e)
-            }
+            loadCroppedWallpaperFile(wm, WallpaperManager.FLAG_LOCK)?.let { return it }
             return null
         }
 
         if (isLiveWallpaper && isEffectsWallpaper) {
             val deBitmap = loadFromDeStorage()
-            if (deBitmap != null) return deBitmap
+            if (deBitmap != null) return LoadedWallpaper(deBitmap, null)
+        }
+
+        if (!isLiveWallpaper) {
+            loadCroppedWallpaperFile(wm, WallpaperManager.FLAG_SYSTEM)?.let { return it }
         }
 
         try {
@@ -257,7 +243,7 @@ class WallpaperDepthService : Service() {
                     TAG,
                     "WM bitmap: ${if (bmp != null) "${bmp.width}x${bmp.height}" else "null"}",
                 )
-                return bmp
+                return LoadedWallpaper(bmp, null)
             }
         } catch (e: Exception) {
             Log.w(TAG, "WallpaperManager load failed", e)
@@ -265,10 +251,27 @@ class WallpaperDepthService : Service() {
 
         if (!isLiveWallpaper) {
             val deBitmap = loadFromDeStorage()
-            if (deBitmap != null) return deBitmap
+            if (deBitmap != null) return LoadedWallpaper(deBitmap, null)
         }
 
         return null
+    }
+
+    private fun loadCroppedWallpaperFile(
+        wm: WallpaperManager,
+        which: Int,
+    ): LoadedWallpaper? {
+        return try {
+            wm.getWallpaperFile(which, true)?.use { pfd ->
+                BitmapFactory.decodeFileDescriptor(pfd.fileDescriptor)?.let { bitmap ->
+                    Log.d(TAG, "Wallpaper crop file ($which): ${bitmap.width}x${bitmap.height}")
+                    LoadedWallpaper(bitmap, which)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Wallpaper file load failed ($which)", e)
+            null
+        }
     }
 
     private fun hasLockWallpaper(wm: WallpaperManager): Boolean {
@@ -299,72 +302,133 @@ class WallpaperDepthService : Service() {
         }
     }
 
-    private fun centerCropToDisplay(bitmap: Bitmap): Bitmap {
-
-        val wm = getSystemService(WindowManager::class.java)
-        val maxBounds = wm?.maximumWindowMetrics?.bounds
-        val dm = resources.displayMetrics
-        val dstW = maxBounds?.width() ?: dm.widthPixels
-        val dstH = maxBounds?.height() ?: dm.heightPixels
-
-        Log.d(
-            TAG,
-            "centerCropToDisplay: " +
-                "maxBounds=${maxBounds?.width()}x${maxBounds?.height()} " +
-                "displayMetrics=${dm.widthPixels}x${dm.heightPixels} " +
-                "using=${dstW}x${dstH} " +
-                "bitmap=${bitmap.width}x${bitmap.height}",
-        )
-
-        if (dstW <= 0 || dstH <= 0) return bitmap
-
-        val srcW = bitmap.width
-        val srcH = bitmap.height
-        val srcAR = srcW.toFloat() / srcH
-        val dstAR = dstW.toFloat() / dstH
-
-        val cropRect =
-            if (srcAR > dstAR) {
-
-                val cropW = (srcH * dstAR).roundToInt().coerceAtMost(srcW)
-                val left = (srcW - cropW) / 2
-                Rect(left, 0, left + cropW, srcH)
-            } else {
-
-                val cropH = (srcW / dstAR).roundToInt().coerceAtMost(srcH)
-                val top = (srcH - cropH) / 2
-                Rect(0, top, srcW, top + cropH)
+    private fun resolveCropRects(
+        wm: WallpaperManager,
+        wallpaper: LoadedWallpaper,
+        targets: List<DisplayLayoutTarget>,
+    ): List<Rect> {
+        return targets.map { target ->
+            val storedHint =
+                wallpaper.which?.let { which ->
+                    try {
+                        wm.getBitmapCrops(listOf(target.displaySize), which, false)
+                            .takeIf { it.isNotEmpty() }?.first()
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+            val matchedCrop =
+                centerCropRect(
+                    wallpaper.bitmap.width,
+                    wallpaper.bitmap.height,
+                    target.displaySize.x,
+                    target.displaySize.y,
+                )
+            if (storedHint == null) {
+                return@map matchedCrop
             }
-
-        if (cropRect.width() >= srcW - 2 && cropRect.height() >= srcH - 2) {
-            return bitmap
-        }
-
-        Log.d(
-            TAG,
-            "Center-crop: ${srcW}x${srcH} -> ${cropRect.width()}x${cropRect.height()} " +
-                "(display ${dstW}x${dstH})",
-        )
-        return try {
-            Bitmap.createBitmap(
-                bitmap,
-                cropRect.left,
-                cropRect.top,
-                cropRect.width(),
-                cropRect.height(),
-            )
-        } catch (e: Exception) {
-            Log.w(TAG, "Center-crop failed", e)
-            bitmap
+            val clamped = clampCrop(storedHint, wallpaper.bitmap)
+            val visibleW = matchedCrop.width().coerceAtMost(clamped.width())
+            val visibleH = matchedCrop.height().coerceAtMost(clamped.height())
+            Rect(
+                clamped.left.coerceAtMost(wallpaper.bitmap.width - visibleW),
+                clamped.top.coerceAtMost(wallpaper.bitmap.height - visibleH),
+                (clamped.left + visibleW).coerceAtMost(wallpaper.bitmap.width),
+                (clamped.top + visibleH).coerceAtMost(wallpaper.bitmap.height),
+            ).also { r -> if (r.width() < 1 || r.height() < 1) return@map matchedCrop }
         }
     }
 
-    private fun clearMask() {
+    private fun extractPath(foreground: Bitmap, cropRect: Rect): String? {
+        val cropped =
+            if (
+                cropRect.left == 0 &&
+                    cropRect.top == 0 &&
+                    cropRect.right == foreground.width &&
+                    cropRect.bottom == foreground.height
+            ) {
+                foreground
+            } else {
+                Bitmap.createBitmap(
+                    foreground,
+                    cropRect.left,
+                    cropRect.top,
+                    cropRect.width(),
+                    cropRect.height(),
+                )
+            }
+        return try {
+            DepthMaskUtils.extractSubjectPath(cropped)
+        } finally {
+            if (cropped !== foreground) cropped.recycle()
+        }
+    }
+
+    private fun publishPaths(
+        paths: List<Pair<DisplayLayoutTarget, String?>>,
+    ) {
+        paths.forEach { (target, path) ->
+            val maskSetting = target.layout.getSettingName(SETTING_DEPTH_MASK)
+            val boundsSetting = target.layout.getSettingName(SETTING_DEPTH_BOUNDS)
+            Settings.Secure.putString(contentResolver, maskSetting, path)
+            Settings.Secure.putString(contentResolver, boundsSetting, null)
+            Log.d(
+                TAG,
+                "Published ${target.layout} depth path " +
+                    if (path == null) "without a subject" else "(${path.length} chars)",
+            )
+        }
+    }
+
+    private fun centerCropRect(srcW: Int, srcH: Int, dstW: Int, dstH: Int): Rect {
+        if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) {
+            return Rect(0, 0, srcW, srcH)
+        }
+        val srcAspect = srcW.toFloat() / srcH
+        val dstAspect = dstW.toFloat() / dstH
+        return if (srcAspect > dstAspect) {
+            val cropW = (srcH * dstAspect).roundToInt().coerceAtMost(srcW)
+            val left = (srcW - cropW) / 2
+            Rect(left, 0, left + cropW, srcH)
+        } else {
+            val cropH = (srcW / dstAspect).roundToInt().coerceAtMost(srcH)
+            val top = (srcH - cropH) / 2
+            Rect(0, top, srcW, top + cropH)
+        }
+    }
+
+    private fun clampCrop(crop: Rect, bitmap: Bitmap): Rect {
+        val clamped =
+            Rect(
+                crop.left.coerceIn(0, bitmap.width),
+                crop.top.coerceIn(0, bitmap.height),
+                crop.right.coerceIn(0, bitmap.width),
+                crop.bottom.coerceIn(0, bitmap.height),
+            )
+        return if (clamped.width() > 0 && clamped.height() > 0) {
+            clamped
+        } else {
+            Rect(0, 0, bitmap.width, bitmap.height)
+        }
+    }
+
+    private fun clearAllMasks() {
+        DisplayLayout.values().forEach {
+            clearMask(it.getSettingName(SETTING_DEPTH_MASK))
+            clearMask(it.getSettingName(SETTING_DEPTH_BOUNDS))
+        }
+    }
+
+    private fun clearMask(setting: String) {
         try {
-            Settings.Secure.putString(contentResolver, SETTING_DEPTH_MASK, null)
-            Settings.Secure.putString(contentResolver, SETTING_DEPTH_BOUNDS, null)
+            Settings.Secure.putString(contentResolver, setting, null)
         } catch (_: Exception) {}
     }
+
+    private data class LoadedWallpaper(
+        val bitmap: Bitmap,
+        val which: Int?,
+    )
 
     private data class ProcessToken(val marker: Any = Any())
 }

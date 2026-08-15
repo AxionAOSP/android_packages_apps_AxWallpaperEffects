@@ -19,10 +19,9 @@ package com.android.axion.wallpapereffects.util
 import android.content.Context
 import android.content.res.Resources
 import android.graphics.RectF
-import android.hardware.display.DisplayManager
-import android.util.DisplayMetrics
 import android.util.Log
 import android.util.Size
+import com.android.axion.util.DisplayUtils
 import kotlin.math.min
 
 class ShapePositionHelper(context: Context) {
@@ -52,40 +51,11 @@ class ShapePositionHelper(context: Context) {
 
         topMargin = (4f * density).toInt()
 
-        val dm = context.getSystemService(DisplayManager::class.java)
-
-        val builtInDisplays =
-            dm?.getDisplays("android.hardware.display.category.ALL_INCLUDING_DISABLED")?.filter {
-                it.type == 1
-            } ?: emptyList()
-
-        var large = false
-        val sizes = mutableListOf<Size>()
-        var largestMetrics: DisplayMetrics? = null
-        var secondMetrics: DisplayMetrics? = null
-        var largestArea = 0f
-
-        for (display in builtInDisplays) {
-            val metrics = DisplayMetrics()
-            display.getRealMetrics(metrics)
-            val area =
-                (metrics.widthPixels.toFloat() / metrics.xdpi) *
-                    (metrics.heightPixels.toFloat() / metrics.ydpi)
-            if (metrics.widthPixels / metrics.density >= 600f) large = true
-            if (area > largestArea) {
-                if (largestMetrics != null) secondMetrics = largestMetrics
-                largestMetrics = metrics
-                largestArea = area
-            } else if (largestMetrics != null) {
-                secondMetrics = metrics
-            }
-            sizes.add(Size(metrics.widthPixels, metrics.heightPixels))
-            sizes.add(Size(metrics.heightPixels, metrics.widthPixels))
-        }
-
-        isLargeScreen = large
-        isFoldable = secondMetrics != null
-        defaultDisplaySizes = sizes
+        val displays = DisplayUtils.getInternalDisplays(context)
+        isLargeScreen = DisplayUtils.isLargeScreenDevice(context)
+        isFoldable = displays.size > 1
+        defaultDisplaySizes =
+            DisplayUtils.getInternalDisplaySizes(context, true).map { Size(it.x, it.y) }
 
         Log.d(
             TAG,
