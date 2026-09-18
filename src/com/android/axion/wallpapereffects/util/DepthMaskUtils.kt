@@ -35,7 +35,8 @@ object DepthMaskUtils {
     private const val PATH_EXTRACT_WIDTH = 512
     private const val MIN_SUBJECT_RATIO = 0.02f
     private const val MASK_ALPHA_THRESHOLD = 128
-    private const val PATH_SIMPLIFY_EPSILON = 2.0f
+    private const val PATH_SIMPLIFY_EPSILON = 1.0f
+    private const val SMOOTHING_PASSES = 2
     private const val NORMALIZE_RANGE = 10000f
 
     fun extractCompactMask(foreground: Bitmap): String? {
@@ -152,7 +153,8 @@ object DepthMaskUtils {
                                 pt[1] / extractH * NORMALIZE_RANGE,
                             )
                         }
-                    douglasPeucker(normalized, epsilon)
+                    val reduced = douglasPeucker(normalized, epsilon)
+                    smoothContour(reduced, SMOOTHING_PASSES)
                 }
                 .filter { it.size >= 3 }
 
@@ -234,6 +236,28 @@ object DepthMaskUtils {
         } else {
             listOf(first, last)
         }
+    }
+
+    private fun smoothContour(points: List<FloatArray>, iterations: Int): List<FloatArray> {
+        if (points.size < 3 || iterations <= 0) return points
+        var current = points
+        for (it in 0 until iterations) {
+            if (current.size >= 200) break
+            val smoothed = mutableListOf(floatArrayOf(0f, 0f)).apply { clear() }
+            val n = current.size
+            for (i in 0 until n) {
+                val p0 = current[i]
+                val p1 = current[(i + 1) % n]
+                val qx = 0.75f * p0[0] + 0.25f * p1[0]
+                val qy = 0.75f * p0[1] + 0.25f * p1[1]
+                val rx = 0.25f * p0[0] + 0.75f * p1[0]
+                val ry = 0.25f * p0[1] + 0.75f * p1[1]
+                smoothed.add(floatArrayOf(qx, qy))
+                smoothed.add(floatArrayOf(rx, ry))
+            }
+            current = smoothed
+        }
+        return current
     }
 
     private fun perpendicularDistance(
