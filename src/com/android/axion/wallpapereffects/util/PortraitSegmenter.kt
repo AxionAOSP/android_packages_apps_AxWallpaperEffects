@@ -18,6 +18,7 @@ package com.android.axion.wallpapereffects.util
 
 import android.content.Context
 import android.graphics.*
+import android.graphics.Bitmap.Config.ARGB_8888
 import android.util.Base64
 import android.util.Log
 import java.io.File
@@ -34,10 +35,12 @@ import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
+import org.tensorflow.lite.support.image.ops.ResizeOp.ResizeMethod
 import org.tensorflow.lite.support.image.ops.TensorOperatorWrapper
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 
 private const val TAG = "PortraitSegmenter"
+private const val DEBUG = false
 private const val RAID_MODEL = "mobile_bg_removal_mosaic_dm1_w_metadata.f16.tflite"
 private const val MATTING_MODEL = "portrait_matting_mask_1024_768.tflite"
 private const val FG_ESTIMATION_MODEL = "foreground_estimator_5680_512_512.tflite"
@@ -53,28 +56,30 @@ class PortraitSegmenter(private val context: Context) {
     fun init() {
         try {
             raidModelFile = cacheModel(RAID_MODEL)
-            Log.d(TAG, "RAID model ready: ${raidModelFile!!.length()} bytes")
+            if (DEBUG) Log.d(TAG, "RAID model ready: ${raidModelFile!!.length()} bytes")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to cache RAID model", e)
             return
         }
         try {
             mattingModelFile = cacheModel(MATTING_MODEL)
-            Log.d(TAG, "Matting model ready: ${mattingModelFile!!.length()} bytes")
+            if (DEBUG) Log.d(TAG, "Matting model ready: ${mattingModelFile!!.length()} bytes")
         } catch (e: Exception) {
             Log.w(TAG, "Matting model not available", e)
         }
         try {
             fgEstModelFile = cacheModel(FG_ESTIMATION_MODEL)
-            Log.d(TAG, "FG estimation model ready: ${fgEstModelFile!!.length()} bytes")
+            if (DEBUG) Log.d(TAG, "FG estimation model ready: ${fgEstModelFile!!.length()} bytes")
         } catch (e: Exception) {
             Log.w(TAG, "FG estimation model not available", e)
         }
         hasFullPipeline = mattingModelFile != null && fgEstModelFile != null
-        Log.d(
-            TAG,
-            "Pipeline mode: ${if (hasFullPipeline) "FULL 3-stage" else "RAID-only fallback"}",
-        )
+        if (DEBUG) {
+            Log.d(
+                TAG,
+                "Pipeline mode: ${if (hasFullPipeline) "FULL 3-stage" else "RAID-only fallback"}",
+            )
+        }
     }
 
     fun isReady(): Boolean = raidModelFile != null
@@ -112,11 +117,13 @@ class PortraitSegmenter(private val context: Context) {
                 runModel(raid, arrayOf(raidInputImage.tensorBuffer.buffer), raidOutputBuffers)
                 coarseMask = convertRaidOutput(raidOutputBuffers, raid)
             }
-            Log.d(
-                TAG,
-                "Stage 1 RAID: coarse mask ${coarseMask.width}x${coarseMask.height}" +
-                    " (${System.currentTimeMillis() - startTime}ms)",
-            )
+            if (DEBUG) {
+                Log.d(
+                    TAG,
+                    "Stage 1 RAID: coarse mask ${coarseMask.width}x${coarseMask.height}" +
+                        " (${System.currentTimeMillis() - startTime}ms)",
+                )
+            }
 
             val t2 = System.currentTimeMillis()
             val mattingOutputBuffers = HashMap<Int, TensorBuffer>()
@@ -151,51 +158,70 @@ class PortraitSegmenter(private val context: Context) {
             confidenceBitmap = mattingResult.first
             refinedAlpha = mattingResult.second
             coarseMask.recycle()
-            Log.d(
-                TAG,
-                "Stage 2 Matting: alpha ${refinedAlpha.width}x${refinedAlpha.height}" +
-                    " (${System.currentTimeMillis() - t2}ms)",
-            )
-
-            val t3 = System.currentTimeMillis()
-            val fgEstOutputBuffers = HashMap<Int, TensorBuffer>()
-            val fgEstMaskTensor: TensorBuffer
-            Interpreter(fgEstModelFile!!, interpreterOptions).use { fgEst ->
-                val fgEstInputImage = normalizeFgEstInput(raidInputImage)
-                fgEstMaskTensor = convertMaskToInputTensor(fgEst, refinedAlpha)
-                runModel(
-                    fgEst,
-                    arrayOf(fgEstInputImage.tensorBuffer.buffer, fgEstMaskTensor.buffer),
-                    fgEstOutputBuffers,
+            if (DEBUG) {
+                Log.d(
+                    TAG,
+                    "Stage 2 Matting: alpha ${refinedAlpha.width}x${refinedAlpha.height}" +
+                        " (${System.currentTimeMillis() - t2}ms)",
                 )
             }
-            Log.d(TAG, "Stage 3 FGEstimation: complete (${System.currentTimeMillis() - t3}ms)")
 
-            val fgOutputTensor = fgEstOutputBuffers[0]!!
-            val maskedFGColors = getMaskedFGColors(fgOutputTensor, fgEstMaskTensor)
+            val alphaMatte =
+                Bitmap.createScaledBitmap(refinedAlpha, bitmap.width, bitmap.height, true)
             refinedAlpha.recycle()
-
-            val scaledFGColors =
-                Bitmap.createScaledBitmap(maskedFGColors, bitmap.width, bitmap.height, true)
-            if (scaledFGColors !== maskedFGColors) maskedFGColors.recycle()
-
-            val confidentFG = getConfidentOriginalPixels(bitmap, confidenceBitmap)
             confidenceBitmap.recycle()
 
-            val canvas = Canvas(scaledFGColors)
-            val paint =
-                Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_OVER)
-                }
-            canvas.drawBitmap(confidentFG, 0f, 0f, paint)
-            confidentFG.recycle()
+            val roi = computeAlphaBoundingBox(alphaMatte)
+            if (roi == null) {
+                if (DEBUG) Log.d(TAG, "No subject detected in bounding box")
+                alphaMatte.recycle()
+                return null
+            }
 
-            Log.d(
-                TAG,
-                "Full pipeline complete: ${scaledFGColors.width}x${scaledFGColors.height}" +
-                    " (total ${System.currentTimeMillis() - startTime}ms)",
-            )
-            scaledFGColors
+            val bw = roi.width()
+            val bh = roi.height()
+            val roiImg = Bitmap.createBitmap(bitmap, roi.left, roi.top, bw, bh)
+            val roiMask = Bitmap.createBitmap(alphaMatte, roi.left, roi.top, bw, bh)
+            alphaMatte.recycle()
+
+            val cleanFgRoi: Bitmap
+            val fgEstFile = fgEstModelFile
+            if (fgEstFile != null && fgEstFile.exists()) {
+                val t3 = System.currentTimeMillis()
+                val fgEstOutputBuffers = HashMap<Int, TensorBuffer>()
+                Interpreter(fgEstFile, interpreterOptions).use { fgEst ->
+                    val fgEstInputImage = convertRoiImageInput(fgEst, roiImg)
+                    val fgEstMaskBuffer = convertRoiMaskInput(fgEst, roiMask)
+                    runModel(
+                        fgEst,
+                        arrayOf(fgEstInputImage.tensorBuffer.buffer, fgEstMaskBuffer),
+                        fgEstOutputBuffers,
+                    )
+                }
+                if (DEBUG) Log.d(TAG, "Stage 3 FGEstimation: complete (${System.currentTimeMillis() - t3}ms)")
+
+                val fgOutputTensor = fgEstOutputBuffers[0]!!
+                val cleanFg512 = convertFgOutput(fgOutputTensor, fgOutputTensor.shape)
+                cleanFgRoi = Bitmap.createScaledBitmap(cleanFg512, bw, bh, true)
+                if (cleanFgRoi !== cleanFg512) cleanFg512.recycle()
+            } else {
+                cleanFgRoi = roiImg
+            }
+
+            val finalBmp = composeFinalImage(bitmap.width, bitmap.height, roi, cleanFgRoi, roiMask)
+            if (cleanFgRoi !== roiImg) cleanFgRoi.recycle()
+            roiImg.recycle()
+            roiMask.recycle()
+
+            if (DEBUG) {
+                Log.d(
+                    TAG,
+                    "Full pipeline complete: ${finalBmp.width}x${finalBmp.height} " +
+                        "ROI [${roi.left}, ${roi.top}, $bw, $bh] " +
+                        "(${System.currentTimeMillis() - startTime}ms)",
+                )
+            }
+            finalBmp
         } catch (e: Exception) {
             Log.e(TAG, "Full pipeline FAILED at runtime, falling back to RAID-only", e)
             fallbackSegment(raidFile, bitmap)
@@ -218,16 +244,36 @@ class PortraitSegmenter(private val context: Context) {
         interp.runForMultipleInputsOutputs(inputBuffers, outputs)
     }
 
+    private fun scaleDownSmooth(src: Bitmap, targetW: Int, targetH: Int): Bitmap {
+        var current = src
+        var curW = src.width
+        var curH = src.height
+
+        while (curW > targetW * 2 && curH > targetH * 2) {
+            curW /= 2
+            curH /= 2
+            val next = Bitmap.createScaledBitmap(current, curW, curH, true)
+            if (current !== src) current.recycle()
+            current = next
+        }
+
+        val finalBmp = Bitmap.createScaledBitmap(current, targetW, targetH, true)
+        if (current !== src) current.recycle()
+        return finalBmp
+    }
+
     private fun convertRaidInput(interp: Interpreter, bitmap: Bitmap): TensorImage {
         val shape = interp.getInputTensor(0).shape()
+        val scaled = scaleDownSmooth(bitmap, shape[2], shape[1])
         val processor =
             ImageProcessor.Builder()
-                .add(ResizeOp(shape[1], shape[2], ResizeOp.ResizeMethod.BILINEAR))
                 .add(TensorOperatorWrapper(CastOp(DataType.FLOAT32)))
                 .build()
         val tensorImage = TensorImage(DataType.UINT8)
-        tensorImage.load(bitmap)
-        return processor.process(tensorImage)
+        tensorImage.load(scaled)
+        val result = processor.process(tensorImage)
+        if (scaled !== bitmap) scaled.recycle()
+        return result
     }
 
     private fun convertRaidOutput(
@@ -254,9 +300,9 @@ class PortraitSegmenter(private val context: Context) {
 
     private fun convertMattingImageInput(interp: Interpreter, bitmap: Bitmap): TensorImage {
         val shape = interp.getInputTensor(0).shape()
+        val scaled = scaleDownSmooth(bitmap, shape[2], shape[1])
         val processor =
             ImageProcessor.Builder()
-                .add(ResizeOp(shape[1], shape[2], ResizeOp.ResizeMethod.BILINEAR))
                 .add(TensorOperatorWrapper(CastOp(DataType.FLOAT32)))
                 .add(
                     TensorOperatorWrapper(
@@ -265,8 +311,10 @@ class PortraitSegmenter(private val context: Context) {
                 )
                 .build()
         val tensorImage = TensorImage(DataType.UINT8)
-        tensorImage.load(bitmap)
-        return processor.process(tensorImage)
+        tensorImage.load(scaled)
+        val result = processor.process(tensorImage)
+        if (scaled !== bitmap) scaled.recycle()
+        return result
     }
 
     private fun convertMaskToInputBuffer(interp: Interpreter, mask: Bitmap): ByteBuffer {
@@ -329,12 +377,17 @@ class PortraitSegmenter(private val context: Context) {
 
         val totalFloats = shape.reduce { acc, v -> acc * v }
         val alphaBuffer = ByteBuffer.allocateDirect(totalFloats).order(ByteOrder.nativeOrder())
+        var minF = Float.MAX_VALUE
+        var maxF = -Float.MAX_VALUE
 
         while (buffer.hasRemaining()) {
             val f = buffer.float
+            if (f < minF) minF = f
+            if (f > maxF) maxF = f
             val alpha = (f.coerceIn(0f, 1f) * 255f).roundToInt()
             alphaBuffer.put(alpha.toByte())
         }
+        if (DEBUG) Log.d(TAG, "convertAlphaOutput: shape=${shape[1]}x${shape[2]}, floatRange=[$minF, $maxF]")
 
         alphaBuffer.rewind()
         val refinedAlpha = Bitmap.createBitmap(w, h, Bitmap.Config.ALPHA_8)
@@ -342,19 +395,106 @@ class PortraitSegmenter(private val context: Context) {
         return refinedAlpha
     }
 
-    private fun normalizeFgEstInput(raidInput: TensorImage): TensorImage {
+    private fun computeAlphaBoundingBox(alphaBmp: Bitmap): Rect? {
+        val w = alphaBmp.width
+        val h = alphaBmp.height
+        val pixels = IntArray(w * h)
+        alphaBmp.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        val visited = BooleanArray(pixels.size)
+        val queue = IntArray(pixels.size)
+        val labels = IntArray(pixels.size)
+        var label = 0
+        var bestLabel = 0
+        var bestCount = 0
+
+        for (start in pixels.indices) {
+            if (Color.alpha(pixels[start]) <= 32 || visited[start]) continue
+            label++
+            var head = 0
+            var tail = 0
+            var count = 0
+            visited[start] = true
+            queue[tail++] = start
+
+            while (head < tail) {
+                val idx = queue[head++]
+                labels[idx] = label
+                count++
+                val x = idx % w
+                val y = idx / w
+                if (x > 0 && !visited[idx - 1] && Color.alpha(pixels[idx - 1]) > 32) {
+                    visited[idx - 1] = true
+                    queue[tail++] = idx - 1
+                }
+                if (x < w - 1 && !visited[idx + 1] && Color.alpha(pixels[idx + 1]) > 32) {
+                    visited[idx + 1] = true
+                    queue[tail++] = idx + 1
+                }
+                if (y > 0 && !visited[idx - w] && Color.alpha(pixels[idx - w]) > 32) {
+                    visited[idx - w] = true
+                    queue[tail++] = idx - w
+                }
+                if (y < h - 1 && !visited[idx + w] && Color.alpha(pixels[idx + w]) > 32) {
+                    visited[idx + w] = true
+                    queue[tail++] = idx + w
+                }
+            }
+
+            if (count > bestCount) {
+                bestCount = count
+                bestLabel = label
+            }
+        }
+
+        val total = w * h
+        if (DEBUG) Log.d(TAG, "computeAlphaBoundingBox: w=$w, h=$h, labels=$label, bestLabel=$bestLabel, bestCount=$bestCount, total=$total, p0Alpha=${Color.alpha(pixels[0])}, centerAlpha=${Color.alpha(pixels[h/2 * w + w/2])}")
+        if (bestCount == 0 || bestCount.toFloat() / total < MIN_SUBJECT_RATIO) {
+            return null
+        }
+
+        var minX = w
+        var maxX = -1
+        var minY = h
+        var maxY = -1
+
+        for (i in pixels.indices) {
+            if (labels[i] == bestLabel) {
+                val x = i % w
+                val y = i / w
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
+            } else {
+                pixels[i] = 0
+            }
+        }
+
+        if (DEBUG) Log.d(TAG, "computeAlphaBoundingBox: bbox=[$minX, $minY, ${maxX - minX + 1}, ${maxY - minY + 1}]")
+        if (maxX < minX || maxY < minY) return null
+        alphaBmp.setPixels(pixels, 0, w, 0, 0, w, h)
+        return Rect(minX, minY, maxX + 1, maxY + 1)
+    }
+
+    private fun convertRoiImageInput(interp: Interpreter, roi: Bitmap): TensorImage {
+        val shape = interp.getInputTensor(0).shape()
         val processor =
             ImageProcessor.Builder()
+                .add(ResizeOp(shape[1], shape[2], ResizeMethod.BILINEAR))
+                .add(TensorOperatorWrapper(CastOp(DataType.FLOAT32)))
                 .add(
                     TensorOperatorWrapper(
                         NormalizeOp(floatArrayOf(0f, 0f, 0f), floatArrayOf(255f, 255f, 255f))
                     )
                 )
                 .build()
-        return processor.process(raidInput)
+        val tensorImage = TensorImage(DataType.UINT8)
+        tensorImage.load(roi)
+        return processor.process(tensorImage)
     }
 
-    private fun convertMaskToInputTensor(interp: Interpreter, mask: Bitmap): TensorBuffer {
+    private fun convertRoiMaskInput(interp: Interpreter, mask: Bitmap): ByteBuffer {
         val shape = interp.getInputTensor(1).shape()
         val scaled = Bitmap.createScaledBitmap(mask, shape[2], shape[1], true)
         val tensorBuffer = TensorBuffer.createFixedSize(shape, DataType.UINT8)
@@ -367,39 +507,67 @@ class PortraitSegmenter(private val context: Context) {
                 .add(CastOp(DataType.FLOAT32))
                 .add(NormalizeOp(0f, 255f))
                 .build()
-        return processor.process(tensorBuffer)
+        return processor.process(tensorBuffer).buffer
     }
 
-    private fun getMaskedFGColors(fgTensor: TensorBuffer, maskTensor: TensorBuffer): Bitmap {
-        val fgBuffer = fgTensor.buffer
-        val maskBuffer = maskTensor.buffer
-        val h = fgTensor.shape[1]
-        val w = fgTensor.shape[2]
-        fgBuffer.rewind()
-        maskBuffer.rewind()
+    private fun convertFgOutput(tensorBuffer: TensorBuffer, shape: IntArray): Bitmap {
+        val h = shape[1]
+        val w = shape[2]
+        val buffer = tensorBuffer.buffer
+        buffer.rewind()
 
         val pixels = IntArray(w * h)
         var i = 0
-        while (fgBuffer.hasRemaining()) {
-            pixels[i] = Color.argb(maskBuffer.float, fgBuffer.float, fgBuffer.float, fgBuffer.float)
+        while (buffer.hasRemaining() && i < pixels.size) {
+            val rf = buffer.float
+            val gf = buffer.float
+            val bf = buffer.float
+            val r = (rf.coerceIn(0f, 1f) * 255f).roundToInt()
+            val g = (gf.coerceIn(0f, 1f) * 255f).roundToInt()
+            val b = (bf.coerceIn(0f, 1f) * 255f).roundToInt()
+            pixels[i] = Color.rgb(r, g, b)
             i++
         }
 
-        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val result = Bitmap.createBitmap(w, h, ARGB_8888)
         result.setPixels(pixels, 0, w, 0, 0, w, h)
         return result
     }
 
-    private fun getConfidentOriginalPixels(original: Bitmap, confidenceBitmap: Bitmap): Bitmap {
-        val scaled =
-            Bitmap.createScaledBitmap(confidenceBitmap, original.width, original.height, true)
-        val canvas = Canvas(scaled)
-        val paint =
-            Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+    private fun composeFinalImage(
+        origW: Int,
+        origH: Int,
+        roi: Rect,
+        cleanFgRoi: Bitmap,
+        roiMask: Bitmap,
+    ): Bitmap {
+        val bw = roi.width()
+        val bh = roi.height()
+        val fgPixels = IntArray(bw * bh)
+        val maskPixels = IntArray(bw * bh)
+        cleanFgRoi.getPixels(fgPixels, 0, bw, 0, 0, bw, bh)
+        roiMask.getPixels(maskPixels, 0, bw, 0, 0, bw, bh)
+
+        val outPixels = IntArray(origW * origH)
+        for (y in 0 until bh) {
+            val outRow = (roi.top + y) * origW + roi.left
+            val roiRow = y * bw
+            for (x in 0 until bw) {
+                val idx = roiRow + x
+                val a = Color.alpha(maskPixels[idx])
+                if (a > 0) {
+                    val rgb = fgPixels[idx]
+                    val r = (Color.red(rgb) * a + 127) / 255
+                    val g = (Color.green(rgb) * a + 127) / 255
+                    val b = (Color.blue(rgb) * a + 127) / 255
+                    outPixels[outRow + x] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                }
             }
-        canvas.drawBitmap(original, 0f, 0f, paint)
-        return scaled
+        }
+
+        val result = Bitmap.createBitmap(origW, origH, ARGB_8888)
+        result.setPixels(outPixels, 0, origW, 0, 0, origW, origH)
+        return result
     }
 
     private fun fallbackSegment(raidFile: File, bitmap: Bitmap): Bitmap? {

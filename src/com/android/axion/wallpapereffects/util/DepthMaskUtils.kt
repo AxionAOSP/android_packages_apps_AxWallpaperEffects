@@ -200,7 +200,7 @@ object DepthMaskUtils {
                     contours.add(current)
                 }
                 PathIterator.VERB_LINE -> {
-                    current?.add(floatArrayOf(pts[0], pts[1]))
+                    current?.add(floatArrayOf(pts[2], pts[3]))
                 }
                 PathIterator.VERB_CLOSE -> {
                     current = null
