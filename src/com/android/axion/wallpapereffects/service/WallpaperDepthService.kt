@@ -101,6 +101,7 @@ class WallpaperDepthService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand")
+        scheduleProcess()
         return START_STICKY
     }
 
@@ -108,6 +109,7 @@ class WallpaperDepthService : Service() {
 
     override fun onDestroy() {
         Log.d(TAG, "onDestroy")
+        handler.removeCallbacks(processRunnable)
         WallpaperManager.getInstance(this).removeOnColorsChangedListener(colorsListener)
         contentResolver.unregisterContentObserver(enabledObserver)
         currentProcessToken = null
@@ -115,7 +117,7 @@ class WallpaperDepthService : Service() {
         super.onDestroy()
     }
 
-    private fun scheduleProcess() {
+    private val processRunnable = Runnable {
         val token = ProcessToken()
         currentProcessToken = token
         processingThread?.interrupt()
@@ -134,6 +136,11 @@ class WallpaperDepthService : Service() {
             }
         processingThread = thread
         thread.start()
+    }
+
+    private fun scheduleProcess() {
+        handler.removeCallbacks(processRunnable)
+        handler.post(processRunnable)
     }
 
     private fun processWallpaper(token: ProcessToken) {
@@ -330,11 +337,19 @@ class WallpaperDepthService : Service() {
             val clamped = clampCrop(storedHint, wallpaper.bitmap)
             val visibleW = matchedCrop.width().coerceAtMost(clamped.width())
             val visibleH = matchedCrop.height().coerceAtMost(clamped.height())
+            val isFullWidth = clamped.left == 0 && clamped.width() >= wallpaper.bitmap.width
+            val isFullHeight = clamped.top == 0 && clamped.height() >= wallpaper.bitmap.height
+            val cropLeft =
+                if (isFullWidth) matchedCrop.left
+                else clamped.left.coerceAtMost(wallpaper.bitmap.width - visibleW)
+            val cropTop =
+                if (isFullHeight) matchedCrop.top
+                else clamped.top.coerceAtMost(wallpaper.bitmap.height - visibleH)
             Rect(
-                clamped.left.coerceAtMost(wallpaper.bitmap.width - visibleW),
-                clamped.top.coerceAtMost(wallpaper.bitmap.height - visibleH),
-                (clamped.left + visibleW).coerceAtMost(wallpaper.bitmap.width),
-                (clamped.top + visibleH).coerceAtMost(wallpaper.bitmap.height),
+                cropLeft,
+                cropTop,
+                (cropLeft + visibleW).coerceAtMost(wallpaper.bitmap.width),
+                (cropTop + visibleH).coerceAtMost(wallpaper.bitmap.height),
             ).also { r -> if (r.width() < 1 || r.height() < 1) return@map matchedCrop }
         }
     }
