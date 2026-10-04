@@ -335,21 +335,14 @@ class WallpaperDepthService : Service() {
                 return@map matchedCrop
             }
             val clamped = clampCrop(storedHint, wallpaper.bitmap)
-            val visibleW = matchedCrop.width().coerceAtMost(clamped.width())
             val visibleH = matchedCrop.height().coerceAtMost(clamped.height())
-            val isFullWidth = clamped.left == 0 && clamped.width() >= wallpaper.bitmap.width
-            val isFullHeight = clamped.top == 0 && clamped.height() >= wallpaper.bitmap.height
-            val cropLeft =
-                if (isFullWidth) matchedCrop.left
-                else clamped.left.coerceAtMost(wallpaper.bitmap.width - visibleW)
-            val cropTop =
-                if (isFullHeight) matchedCrop.top
-                else clamped.top.coerceAtMost(wallpaper.bitmap.height - visibleH)
+            val cropTop = clamped.top.coerceAtMost(wallpaper.bitmap.height - visibleH)
+            val cropBottom = (cropTop + visibleH).coerceAtMost(wallpaper.bitmap.height)
             Rect(
-                cropLeft,
+                clamped.left,
                 cropTop,
-                (cropLeft + visibleW).coerceAtMost(wallpaper.bitmap.width),
-                (cropTop + visibleH).coerceAtMost(wallpaper.bitmap.height),
+                clamped.right,
+                cropBottom,
             ).also { r -> if (r.width() < 1 || r.height() < 1) return@map matchedCrop }
         }
     }
